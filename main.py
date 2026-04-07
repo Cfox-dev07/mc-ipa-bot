@@ -2,17 +2,21 @@ import os
 import sqlite3
 import re
 import logging
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters
+from telegram import Update
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters
+)
 
-# ================= LOG =================
+# ================== CONFIG ==================
+TOKEN = os.getenv("TOKEN")
+
 logging.basicConfig(level=logging.INFO)
 
-# ================= TOKEN =================
-TOKEN = os.getenv("TOKEN")
-if not TOKEN:
-    raise ValueError("TOKEN chưa được set")
-
-# ================= DB =================
+# ================== DATABASE ==================
 conn = sqlite3.connect("ipa.db", check_same_thread=False)
 cursor = conn.cursor()
 
@@ -20,14 +24,13 @@ cursor.execute("""
 CREATE TABLE IF NOT EXISTS ipa_files (
     app_name TEXT,
     version TEXT,
-    file_id TEXT UNIQUE,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    file_id TEXT,
     PRIMARY KEY (app_name, version)
 )
 """)
 conn.commit()
 
-# ================= MAP APP =================
+# ================== APP MAP ==================
 APP_MAP = {
     "minecraft": "minecraft",
     "mc": "minecraft",
@@ -43,31 +46,19 @@ APP_MAP = {
     "rocket": "shadowrocket"
 }
 
-# ================= ADMIN (tuỳ chọn) =================
-ADMIN_ID = None  # điền Telegram ID của bạn nếu muốn khóa upload
-
-# ================= HELP =================
-async def start(update, context):
-    await update.message.reply_text(
-        "📦 IPA BOT\n\n"
-        "/get app version\n"
-        "/list app\n"
-        "/latest app\n"
-        "/search keyword\n"
-    )
-
-# ================= PARSE =================
+# ================== PARSE FILE ==================
 def parse_file(doc, caption):
     app_name = None
     version = None
 
-    # caption
+    # 1. từ caption
     if caption:
         parts = caption.lower().split()
         if len(parts) >= 2:
-            app_name, version = parts[0], parts[1]
+            app_name = parts[0]
+            version = parts[1]
 
-    # filename
+    # 2. từ file name
     if not version and doc.file_name:
         name = doc.file_name.lower()
 
@@ -81,22 +72,32 @@ def parse_file(doc, caption):
 
     return app_name, version
 
-# ================= SAVE FILE =================
-async def save_file(update, context):
-    try:
-        msg = update.channel_post or update.message
-        if not msg or not msg.document:
-            return
+# ================== START ==================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "IPA BOT\n\n"
+        "/get app version\n"
+        "/list app\n"
+        "/latest app\n\n"
+        "Ví dụ:\n"
+        "/get minecraft 1.20.1"
+    )
 
-        # nếu set admin thì chặn người khác
-        if ADMIN_ID and msg.from_user and msg.from_user.id != ADMIN_ID:
+# ================== SAVE FILE ==================
+async def save_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        msg = update.message
+
+        if not msg or not msg.document:
             return
 
         doc = msg.document
         app_name, version = parse_file(doc, msg.caption)
 
+        logging.info(f"RAW: {app_name} {version}")
+
         if not app_name or not version:
-            logging.info("Skip file (no parse)")
+            logging.info("Parse fail")
             return
 
         cursor.execute("""
@@ -105,13 +106,14 @@ async def save_file(update, context):
         """, (app_name, version, doc.file_id))
 
         conn.commit()
-        logging.info(f"Saved: {app_name} {version}")
+
+        logging.info(f"SAVED: {app_name} {version}")
 
     except Exception as e:
-        logging.error(f"save_file error: {e}")
+        logging.error(f"ERROR: {e}")
 
-# ================= GET =================
-async def get_app(update, context):
+# ================== GET ==================
+async def get_app(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 2:
         await update.message.reply_text("/get app version")
         return
@@ -119,32 +121,29 @@ async def get_app(update, context):
     app = APP_MAP.get(context.args[0].lower(), context.args[0].lower())
     version = context.args[1]
 
-    cursor.execute("""
-        SELECT file_id FROM ipa_files
-        WHERE app_name=? AND version=?
-    """, (app, version))
+    cursor.execute(
+        "SELECT file_id FROM ipa_files WHERE app_name=? AND version=?",
+        (app, version)
+    )
+    result = cursor.fetchone()
 
-    row = cursor.fetchone()
-
-    if row:
-        await update.message.reply_document(row[0], caption=f"{app} {version}")
+    if result:
+        await update.message.reply_document(result[0])
     else:
         await update.message.reply_text("Không có file")
 
-# ================= LIST =================
-async def list_app(update, context):
-    if not context.args:
+# ================== LIST ==================
+async def list_app(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 1:
         await update.message.reply_text("/list app")
         return
 
     app = APP_MAP.get(context.args[0].lower(), context.args[0].lower())
 
-    cursor.execute("""
-        SELECT version FROM ipa_files
-        WHERE app_name=?
-        ORDER BY created_at DESC
-    """, (app,))
-
+    cursor.execute(
+        "SELECT version FROM ipa_files WHERE app_name=? ORDER BY version",
+        (app,)
+    )
     rows = cursor.fetchall()
 
     if rows:
@@ -153,68 +152,42 @@ async def list_app(update, context):
     else:
         await update.message.reply_text("Trống")
 
-# ================= LATEST =================
-async def latest(update, context):
-    if not context.args:
+# ================== LATEST ==================
+async def latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 1:
         await update.message.reply_text("/latest app")
         return
 
     app = APP_MAP.get(context.args[0].lower(), context.args[0].lower())
 
-    cursor.execute("""
-        SELECT version, file_id FROM ipa_files
-        WHERE app_name=?
-        ORDER BY created_at DESC
-        LIMIT 1
-    """, (app,))
+    cursor.execute(
+        "SELECT version, file_id FROM ipa_files WHERE app_name=? ORDER BY version DESC LIMIT 1",
+        (app,)
+    )
+    result = cursor.fetchone()
 
-    row = cursor.fetchone()
-
-    if row:
-        await update.message.reply_document(
-            row[1],
-            caption=f"{app} latest {row[0]}"
-        )
+    if result:
+        await update.message.reply_document(result[1])
     else:
-        await update.message.reply_text("Không có data")
+        await update.message.reply_text("Trống")
 
-# ================= SEARCH =================
-async def search(update, context):
-    if not context.args:
-        await update.message.reply_text("/search keyword")
-        return
-
-    keyword = context.args[0].lower()
-
-    cursor.execute("""
-        SELECT app_name, version
-        FROM ipa_files
-        WHERE app_name LIKE ?
-        ORDER BY created_at DESC
-        LIMIT 20
-    """, (f"%{keyword}%",))
-
+# ================== DEBUG DB ==================
+async def debug_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cursor.execute("SELECT * FROM ipa_files")
     rows = cursor.fetchall()
+    await update.message.reply_text(str(rows))
 
-    if rows:
-        text = "\n".join([f"{a} - {v}" for a, v in rows])
-        await update.message.reply_text(text)
-    else:
-        await update.message.reply_text("Không thấy")
-
-# ================= INIT =================
+# ================== BOT INIT ==================
 app = ApplicationBuilder().token(TOKEN).build()
 
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("get", get_app))
 app.add_handler(CommandHandler("list", list_app))
 app.add_handler(CommandHandler("latest", latest))
-app.add_handler(CommandHandler("search", search))
+app.add_handler(CommandHandler("db", debug_db))
 
+# FIX: bắt file trong group + private
 app.add_handler(MessageHandler(filters.Document.ALL, save_file))
 
-# ================= RUN FIX =================
 print("BOT RUNNING...")
-app.run_polling(
-    drop_pending_updates=True
-)
+app.run_polling()
