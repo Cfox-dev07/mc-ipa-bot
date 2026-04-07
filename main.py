@@ -9,6 +9,7 @@ async def start(update, context):
 app = ApplicationBuilder().token(TOKEN).build()
 
 app.add_handler(CommandHandler("start", start))
+app.add_handler(MessageHandler(filters.Document.ALL, save_file))
 
 app.run_polling()
 from telegram.ext import MessageHandler, filters
