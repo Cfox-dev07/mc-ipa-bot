@@ -3,17 +3,11 @@ from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, fil
 
 TOKEN = os.getenv("TOKEN")
 
+# --- Lệnh /start ---
 async def start(update, context):
     await update.message.reply_text("Bot Minecraft đang chạy")
 
-app = ApplicationBuilder().token(TOKEN).build()
-
-app.add_handler(CommandHandler("start", start))
-app.add_handler(MessageHandler(filters.Document.ALL, save_file))
-
-app.run_polling()
-from telegram.ext import MessageHandler, filters
-
+# --- Hàm đọc file từ channel ---
 async def save_file(update, context):
     if update.channel_post:
         doc = update.channel_post.document
@@ -34,3 +28,13 @@ async def save_file(update, context):
 
         except:
             print("Caption sai")
+
+# --- Khởi tạo bot ---
+app = ApplicationBuilder().token(TOKEN).build()
+
+# --- Handler ---
+app.add_handler(CommandHandler("start", start))
+app.add_handler(MessageHandler(filters.Document.ALL, save_file))
+
+# --- Chạy bot ---
+app.run_polling()
