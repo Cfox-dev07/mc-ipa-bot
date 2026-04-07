@@ -2,6 +2,7 @@ import os
 import sqlite3
 import re
 import logging
+import asyncio
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -30,38 +31,33 @@ CREATE TABLE IF NOT EXISTS ipa_files (
 """)
 conn.commit()
 
+# ================= CACHE =================
+cache = {}  # giảm query DB
+
 # ================= APP MAP =================
 APP_MAP = {
     "minecraft": "minecraft",
     "mc": "minecraft",
-
     "gta": "gta_sa",
     "gta_sa": "gta_sa",
     "sanandreas": "gta_sa",
-
     "gtavc": "gta_vc",
     "vicecity": "gta_vc",
-
     "shadowrocket": "shadowrocket",
     "rocket": "shadowrocket"
 }
 
 # ================= PARSE =================
 def parse_file(doc, caption):
-    app_name = None
-    version = None
+    app_name, version = None, None
 
-    # 1. caption
     if caption:
         parts = caption.lower().split()
         if len(parts) >= 2:
-            app_name = parts[0]
-            version = parts[1]
+            app_name, version = parts[0], parts[1]
 
-    # 2. filename fallback
     if not version and doc.file_name:
         name = doc.file_name.lower()
-
         match = re.search(r"([a-zA-Z_]+)[ _-]?(\d+(\.\d+)+)", name)
         if match:
             app_name = match.group(1)
@@ -72,48 +68,52 @@ def parse_file(doc, caption):
 
     return app_name, version
 
+# ================= SAFE SEND =================
+async def safe_send(func, *args, retries=3):
+    for i in range(retries):
+        try:
+            return await func(*args)
+        except Exception as e:
+            logging.warning(f"Retry {i+1}: {e}")
+            await asyncio.sleep(1)
+
 # ================= START =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "IPA BOT\n\n"
-        "/get app version\n"
-        "/list app\n"
-        "/latest app"
+        "/get app version\n/list app\n/latest app"
     )
 
-# ================= SAVE FILE (FIX ALL TYPES) =================
+# ================= SAVE FILE =================
 async def save_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        msg = (
-            update.message or
-            update.channel_post or
-            update.edited_message
-        )
+    msg = update.message or update.channel_post or update.edited_message
+    if not msg or not msg.document:
+        return
 
-        if not msg or not msg.document:
-            return
+    doc = msg.document
 
-        doc = msg.document
+    app_name, version = parse_file(doc, msg.caption)
 
-        app_name, version = parse_file(doc, msg.caption)
+    if not app_name or not version:
+        return
 
-        logging.info(f"PARSED: {app_name} {version}")
+    key = f"{app_name}:{version}"
 
-        if not app_name or not version:
-            logging.info("SKIP: cannot parse")
-            return
+    # tránh ghi DB trùng
+    if key in cache:
+        return
 
-        cursor.execute("""
-            INSERT OR REPLACE INTO ipa_files (app_name, version, file_id)
-            VALUES (?, ?, ?)
-        """, (app_name, version, doc.file_id))
+    cache[key] = doc.file_id
 
-        conn.commit()
+    cursor.execute("""
+        INSERT OR REPLACE INTO ipa_files (app_name, version, file_id)
+        VALUES (?, ?, ?)
+    """, (app_name, version, doc.file_id))
 
-        logging.info(f"SAVED: {app_name} {version}")
+    conn.commit()
 
-    except Exception as e:
-        logging.error(f"ERROR: {e}")
+    logging.info(f"SAVED {key}")
+
+    await asyncio.sleep(0.3)  # giảm rate limit
 
 # ================= GET =================
 async def get_app(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -124,16 +124,23 @@ async def get_app(update: Update, context: ContextTypes.DEFAULT_TYPE):
     app = APP_MAP.get(context.args[0].lower(), context.args[0].lower())
     version = context.args[1]
 
-    cursor.execute(
-        "SELECT file_id FROM ipa_files WHERE app_name=? AND version=?",
-        (app, version)
-    )
-    result = cursor.fetchone()
+    key = f"{app}:{version}"
 
-    if result:
-        await update.message.reply_document(result[0])
+    if key in cache:
+        file_id = cache[key]
     else:
-        await update.message.reply_text("Không có file")
+        cursor.execute(
+            "SELECT file_id FROM ipa_files WHERE app_name=? AND version=?",
+            (app, version)
+        )
+        result = cursor.fetchone()
+        if not result:
+            await update.message.reply_text("Không có file")
+            return
+        file_id = result[0]
+        cache[key] = file_id
+
+    await safe_send(update.message.reply_document, file_id)
 
 # ================= LIST =================
 async def list_app(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -169,15 +176,14 @@ async def latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     result = cursor.fetchone()
 
     if result:
-        await update.message.reply_document(result[1])
+        await safe_send(update.message.reply_document, result[1])
     else:
         await update.message.reply_text("Trống")
 
 # ================= DEBUG =================
 async def debug_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cursor.execute("SELECT * FROM ipa_files")
-    rows = cursor.fetchall()
-    await update.message.reply_text(str(rows))
+    await update.message.reply_text(str(cursor.fetchall()))
 
 # ================= BOT INIT =================
 app = ApplicationBuilder().token(TOKEN).build()
@@ -188,8 +194,8 @@ app.add_handler(CommandHandler("list", list_app))
 app.add_handler(CommandHandler("latest", latest))
 app.add_handler(CommandHandler("db", debug_db))
 
-# BẮT TẤT CẢ UPDATE (FIX 3 LOẠI CHAT)
+# bắt tất cả loại message
 app.add_handler(MessageHandler(filters.ALL, save_file))
 
-print("BOT RUNNING...")
+print("BOT RUNNING")
 app.run_polling()
